@@ -1,0 +1,314 @@
+#include "HX711.h"
+
+// === Pin Definitions ===
+#define LOADCELL_DOUT_PIN 3
+#define LOADCELL_SCK_PIN 2
+#define REWARD_SOLENOID_PIN 7
+#define PISTON_SOLENOID_PIN 8
+#define SWITCH_LEFT_PIN 5
+#define SWITCH_RIGHT_PIN 4
+#define CAP_SENSOR_PIN 6
+#define FORWARD_PIN 11
+#define BACKWARD_PIN 12
+#define UPWARD_PIN 9
+#define DOWNWARD_PIN 13
+
+// === Load Cell ===
+HX711 loadcell;
+float calibration_factor = -3060.5;
+
+// === Timing Variables ===
+unsigned long tStart;
+unsigned long lastWeightTime = 0;
+unsigned long lastRewardTime = 0;
+unsigned long lastStruggleMsg = 0;
+
+// === Parameters (configurable from GUI) ===
+unsigned long rewardDelay = 1000;
+unsigned long rewardDuration = 65;
+unsigned long rewardBuffer = 1000;
+unsigned long fixDuration = 10000;
+unsigned long fixDelay = 1000;
+unsigned long fixBuffer = 10000;
+int struggleThreshold = 550;
+
+// === State Flags ===
+bool fixationActive = false;
+bool flushing = false;
+bool allow_free_reward = true;   // default: ON
+bool habituationMode = false;
+bool sessionActive = false;
+bool timeupCooldown = false;
+
+// === Fixation Tracking ===
+unsigned long fixationStartTime = 0;
+unsigned long lastFixEndTime = 0;
+
+// === Trial Counters ===
+int trialFix = 0;
+int trialEscape = 0;
+int trialTimeup = 0;
+int trialStruggle = 0;
+int trialReward = 0;
+
+// === Actuator Control ===
+int currentLevel = 1;
+const int TOTAL_TRAVEL_TIME = 5500;
+int stepTime = TOTAL_TRAVEL_TIME / 4;
+int consecutiveRewards = 0;
+
+// === Movement Timers ===
+bool actuatorMoving = false;
+unsigned long actuatorStopTime = 0;
+
+// === Reward Timers ===
+bool rewardActive = false;
+unsigned long rewardStopTime = 0;
+
+// === Helper Functions ===
+void stopSpout() {
+  digitalWrite(FORWARD_PIN, LOW);
+  digitalWrite(BACKWARD_PIN, LOW);
+  digitalWrite(UPWARD_PIN, LOW);
+  digitalWrite(DOWNWARD_PIN, LOW);
+}
+
+void sendEvent(unsigned long durationSec) {
+  if (!sessionActive) return;
+  Serial.print("EVENT,");
+  Serial.print(durationSec); Serial.print(",");
+  Serial.print(trialFix); Serial.print(",");
+  Serial.print(trialEscape); Serial.print(",");
+  Serial.print(trialTimeup); Serial.print(",");
+  Serial.print(trialStruggle); Serial.print(",");
+  Serial.println(trialReward);
+}
+
+void resetTrialCounters() {
+  trialFix = trialEscape = trialTimeup = trialStruggle = trialReward = 0;
+}
+
+// === Reward Handling ===
+void startReward() {
+  rewardActive = true;
+  rewardStopTime = millis() + rewardDuration;
+  digitalWrite(REWARD_SOLENOID_PIN, LOW);
+  Serial.println("Reward Given");
+
+  if (habituationMode) {
+    consecutiveRewards++;
+    if (consecutiveRewards >= 25 && currentLevel > 1) {
+      currentLevel--;
+      startActuatorMove(-1);
+      Serial.print("Habituation moved to Level ");
+      Serial.println(currentLevel);
+      consecutiveRewards = 0;
+    }
+  } else {
+    consecutiveRewards = 0;
+  }
+}
+
+void updateReward() {
+  if (rewardActive && millis() >= rewardStopTime) {
+    digitalWrite(REWARD_SOLENOID_PIN, HIGH);
+    rewardActive = false;
+  }
+}
+
+// === Actuator Movement (non-blocking) ===
+void startActuatorMove(int direction) {
+  actuatorMoving = true;
+  actuatorStopTime = millis() + (abs(direction) * stepTime);
+
+  stopSpout();
+  if (direction > 0) digitalWrite(BACKWARD_PIN, HIGH);
+  else if (direction < 0) digitalWrite(FORWARD_PIN, HIGH);
+}
+
+void updateActuatorMove() {
+  if (actuatorMoving && millis() >= actuatorStopTime) {
+    stopSpout();
+    actuatorMoving = false;
+  }
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(REWARD_SOLENOID_PIN, OUTPUT);
+  pinMode(PISTON_SOLENOID_PIN, OUTPUT);
+  digitalWrite(REWARD_SOLENOID_PIN, HIGH);
+  digitalWrite(PISTON_SOLENOID_PIN, HIGH);
+
+  pinMode(SWITCH_LEFT_PIN, INPUT_PULLUP);
+  pinMode(SWITCH_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(CAP_SENSOR_PIN, INPUT);
+
+  pinMode(FORWARD_PIN, OUTPUT);
+  pinMode(BACKWARD_PIN, OUTPUT);
+  pinMode(UPWARD_PIN, OUTPUT);
+  pinMode(DOWNWARD_PIN, OUTPUT);
+  stopSpout();
+
+  loadcell.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  loadcell.set_scale(calibration_factor);
+  loadcell.tare();
+
+  Serial.println("System Booting...");
+  delay(1000);
+
+  lastFixEndTime = millis();
+  Serial.println("System Ready");
+  tStart = millis();
+}
+
+// === Loop ===
+void loop() {
+  // === Load Cell ===
+  float wt = 0;
+  if (loadcell.is_ready()) {
+    wt = loadcell.get_units();
+  }
+
+  if (millis() - lastWeightTime > 100) {
+    Serial.print("W,");
+    Serial.print(wt);
+    Serial.print(",");
+    Serial.println(millis() - tStart);
+    lastWeightTime = millis();
+  }
+
+  // === Switch Inputs ===
+  bool leftPressed = (digitalRead(SWITCH_LEFT_PIN) == HIGH);
+  bool rightPressed = (digitalRead(SWITCH_RIGHT_PIN) == HIGH);
+  if (!leftPressed && !rightPressed) timeupCooldown = false;
+
+  // === Fixation Start ===
+  if (leftPressed && rightPressed && !fixationActive && !timeupCooldown &&
+      millis() - lastFixEndTime >= fixDelay) {
+    fixationActive = true;
+    digitalWrite(PISTON_SOLENOID_PIN, LOW);
+    fixationStartTime = millis();
+    Serial.println("Fixation Engaged");
+    resetTrialCounters();
+    trialFix = 1;
+  }
+
+  // === Fixation Release (manual) ===
+  if ((!leftPressed || !rightPressed) && fixationActive) {
+    fixationActive = false;
+    digitalWrite(PISTON_SOLENOID_PIN, HIGH);
+    lastFixEndTime = millis();
+    unsigned long durationSec = (millis() - fixationStartTime) / 1000.0;
+
+    if (millis() - fixationStartTime < fixBuffer) {
+      Serial.println("Escape Event");
+      trialEscape = 1;
+    } else {
+      Serial.println("Fixation Released");
+    }
+
+    sendEvent(durationSec);
+    resetTrialCounters();
+  }
+
+  // === Auto-release (time limit) ===
+  if (fixationActive && millis() - fixationStartTime >= fixDuration) {
+    fixationActive = false;
+    digitalWrite(PISTON_SOLENOID_PIN, HIGH);
+    lastFixEndTime = millis();
+    trialTimeup = 1;
+    unsigned long durationSec = (millis() - fixationStartTime) / 1000.0;
+
+    Serial.println("Time-Up Release");
+    sendEvent(durationSec);
+    resetTrialCounters();
+    timeupCooldown = true;
+  }
+
+  // === Struggle Release ===
+  if (fixationActive && abs(wt) > struggleThreshold) {
+    fixationActive = false;
+    digitalWrite(PISTON_SOLENOID_PIN, HIGH);
+    lastFixEndTime = millis();
+    trialStruggle = 1;
+    unsigned long durationSec = (millis() - fixationStartTime) / 1000.0;
+
+    Serial.println("Fixation Released due to struggle");
+    sendEvent(durationSec);
+    resetTrialCounters();
+  } else if (fixationActive && millis() - lastStruggleMsg > 500) {
+    Serial.println("Struggle NO");
+    lastStruggleMsg = millis();
+  }
+
+  // === Reward Logic ===
+  bool rewardAllowed = allow_free_reward ||
+                       (fixationActive && millis() - fixationStartTime >= rewardBuffer);
+
+  if (digitalRead(CAP_SENSOR_PIN) == HIGH &&
+      millis() - lastRewardTime > rewardDelay &&
+      rewardAllowed && !flushing) {
+    startReward();
+    lastRewardTime = millis();
+    trialReward++;
+    if (!fixationActive && sessionActive) {
+      sendEvent(0);
+      resetTrialCounters();
+    }
+  }
+
+  if (flushing) digitalWrite(REWARD_SOLENOID_PIN, LOW);
+  updateReward();
+  updateActuatorMove();
+
+  // === Serial Commands ===
+  while (Serial.available()) {
+    char cmd = Serial.read();
+    switch (cmd) {
+      case 'j': digitalWrite(PISTON_SOLENOID_PIN, HIGH); fixationActive = false; Serial.println("Emergency Release"); break;
+      case 'b': sessionActive = true; tStart = millis(); Serial.println("Session Started"); break;
+      case 'c': sessionActive = false; Serial.println("Session Stopped"); break;
+      case 'w': flushing = !flushing; digitalWrite(REWARD_SOLENOID_PIN, flushing ? LOW : HIGH); Serial.println(flushing ? "Flush ON" : "Flush OFF"); break;
+      case 'F': stopSpout(); digitalWrite(BACKWARD_PIN, HIGH); break;
+      case 'B': stopSpout(); digitalWrite(FORWARD_PIN, HIGH); break;
+      case 'U': stopSpout(); digitalWrite(UPWARD_PIN, HIGH); break;
+      case 'D': stopSpout(); digitalWrite(DOWNWARD_PIN, HIGH); break;
+      case 'S': stopSpout(); break;
+
+      case 'R': rewardDuration = Serial.parseInt(); break;
+      case 'M': {
+        int val = Serial.parseInt();   // expect 0 or 1
+        allow_free_reward = (val == 1);
+        Serial.print("Free Reward ");
+        Serial.println(allow_free_reward ? "ON" : "OFF");
+        break;
+      }
+      case 'H': {
+        int val = Serial.parseInt();   // expect 0 or 1
+        habituationMode = (val == 1);
+        Serial.println(habituationMode ? "Habituation ON" : "Habituation OFF");
+        break;
+      }
+      case 'T': struggleThreshold = Serial.parseInt(); break;
+      case 'X': fixDuration = Serial.parseInt(); break;
+      case 'Y': fixDelay = Serial.parseInt(); break;
+      case 'Z': fixBuffer = Serial.parseInt(); break;
+      case 'Q': rewardBuffer = Serial.parseInt(); break;
+
+      case 'L': {
+        int newLevel = Serial.parseInt();
+        if (newLevel >= 1 && newLevel <= 5 && newLevel != currentLevel) {
+          int diff = newLevel - currentLevel;
+          startActuatorMove(diff);
+          currentLevel = newLevel;
+          Serial.print("Moved to Level ");
+          Serial.println(currentLevel);
+        }
+        break;
+      }
+    }
+  }
+}
